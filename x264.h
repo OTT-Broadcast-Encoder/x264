@@ -247,7 +247,7 @@ static const char * const x264_transfer_names[] = { "", "bt709", "undef", "", "b
                                                     "iec61966-2-4", "bt1361e", "iec61966-2-1", "bt2020-10", "bt2020-12", "smpte2084", "smpte428", "arib-std-b67", 0 };
 static const char * const x264_colmatrix_names[] = { "GBR", "bt709", "undef", "", "fcc", "bt470bg", "smpte170m", "smpte240m", "YCgCo", "bt2020nc", "bt2020c",
                                                      "smpte2085", "chroma-derived-nc", "chroma-derived-c", "ICtCp", 0 };
-static const char * const x264_nal_hrd_names[] = { "none", "vbr", "cbr", 0 };
+static const char * const x264_nal_hrd_names[] = { "none", "vbr", "cbr", "fakevbr", "fakecbr", 0 };
 static const char * const x264_avcintra_flavor_names[] = { "panasonic", "sony", 0 };
 static const char * const x264_log_level_names[] = { "none", "error", "warning", "info", "debug", 0 };
 
@@ -301,6 +301,8 @@ static const char * const x264_log_level_names[] = { "none", "error", "warning",
 #define X264_NAL_HRD_NONE            0
 #define X264_NAL_HRD_VBR             1
 #define X264_NAL_HRD_CBR             2
+#define X264_NAL_HRD_FAKE_VBR        3
+#define X264_NAL_HRD_FAKE_CBR        4
 
 /* SEI level */
 #define X264_OPTS_NONE          0x0000
@@ -616,6 +618,15 @@ typedef struct x264_param_t
 
     /* alternative transfer SEI */
     int i_alternative_transfer;
+    /* Speed control parameters */
+    struct
+    {
+        float       f_speed;        /* ratio from realtime */
+        int         i_buffer_size;  /* number of frames */
+        float       f_buffer_init;  /* fraction of size */
+        int         b_alt_timer;    /* use a different method of measuring encode time */
+        int         max_preset;     /* maximum number of speedcontrol presets to use */
+    } sc;
 
     /* Muxing parameters */
     int b_aud;                  /* generate access unit delimiters */
@@ -869,11 +880,11 @@ enum pic_struct_e
 
 typedef struct x264_hrd_t
 {
-    double cpb_initial_arrival_time;
-    double cpb_final_arrival_time;
-    double cpb_removal_time;
+    int64_t cpb_initial_arrival_time;
+    int64_t cpb_final_arrival_time;
+    int64_t cpb_removal_time;
 
-    double dpb_output_time;
+    int64_t dpb_output_time;
 } x264_hrd_t;
 
 /* Arbitrary user SEI:
@@ -1125,6 +1136,10 @@ X264_API void x264_encoder_intra_refresh( x264_t * );
  *
  *      Returns 0 on success, negative on failure. */
 X264_API int x264_encoder_invalidate_reference( x264_t *, int64_t pts );
+
+/* x264_speedcontrol_sync:
+ *      override speedcontrol's internal clock */
+X264_API void x264_speedcontrol_sync( x264_t *, float f_buffer_fill, int i_buffer_size, int buffer_complete );
 
 #ifdef __cplusplus
 }

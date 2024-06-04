@@ -178,6 +178,9 @@ struct x264_ratecontrol_t
     int initial_cpb_removal_delay_offset;
     double nrt_first_access_unit; /* nominal removal time */
     double previous_cpb_final_arrival_time;
+    /* Integer and fractional part of the cpb arrival time */
+    int64_t previous_cpb_final_arrival_time_int;
+    int64_t previous_cpb_final_arrival_time_frac;
     uint64_t hrd_multiply_denom;
 };
 
@@ -933,7 +936,7 @@ void x264_ratecontrol_init_reconfigurable( x264_t *h, int b_init )
         if( h->param.i_nal_hrd && b_init )
         {
             h->sps->vui.hrd.i_cpb_cnt = 1;
-            h->sps->vui.hrd.b_cbr_hrd = h->param.i_nal_hrd == X264_NAL_HRD_CBR;
+            h->sps->vui.hrd.b_cbr_hrd = h->param.i_nal_hrd == X264_NAL_HRD_CBR || h->param.i_nal_hrd == X264_NAL_HRD_FAKE_CBR;
             h->sps->vui.hrd.i_time_offset_length = 0;
 
             #define BR_SHIFT  6
@@ -966,7 +969,7 @@ void x264_ratecontrol_init_reconfigurable( x264_t *h, int b_init )
             vbv_buffer_size = h->sps->vui.hrd.i_cpb_size_unscaled;
             vbv_max_bitrate = h->sps->vui.hrd.i_bit_rate_unscaled;
         }
-        else if( h->param.i_nal_hrd && !b_init )
+        else if( ( h->param.i_nal_hrd == X264_NAL_HRD_VBR || h->param.i_nal_hrd == X264_NAL_HRD_CBR ) && !b_init )
         {
             x264_log( h, X264_LOG_WARNING, "VBV parameters cannot be changed when NAL HRD is in use\n" );
             return;
@@ -980,6 +983,29 @@ void x264_ratecontrol_init_reconfigurable( x264_t *h, int b_init )
         rc->vbv_max_rate = vbv_max_bitrate;
         rc->buffer_size = vbv_buffer_size;
         rc->single_frame_vbv = rc->buffer_rate * 1.1 > rc->buffer_size;
+        if( rc->single_frame_vbv && h->param.i_nal_hrd > X264_NAL_HRD_CBR )
+            rc->buffer_size = rc->buffer_rate;
+
+        h->sps->vui.hrd.i_bit_rate_unscaled = rc->vbv_max_rate;
+        h->sps->vui.hrd.i_cpb_size_unscaled = rc->buffer_size;
+
+        if( h->param.i_nal_hrd )
+        {
+            uint64_t denom = (uint64_t)h->sps->vui.hrd.i_bit_rate_unscaled * h->sps->vui.i_time_scale;
+            uint64_t num = 54000000;
+            x264_reduce_fraction64( &num, &denom );
+            rc->hrd_multiply_denom = 54000000 / num;
+
+            double bits_required = log2( num )
+                                + log2( h->sps->vui.i_time_scale )
+                                + log2( h->sps->vui.hrd.i_cpb_size_unscaled );
+            if( bits_required >= 63 )
+            {
+                x264_log( h, X264_LOG_ERROR, "HRD with very large timescale and bufsize not supported\n" );
+                return -1;
+            }
+        }
+
         if( rc->b_abr && h->param.rc.i_rc_method == X264_RC_ABR )
             rc->cbr_decay = 1.0 - rc->buffer_rate / rc->buffer_size
                           * 0.5 * X264_MAX(0, 1.5 - rc->buffer_rate * rc->fps / rc->bitrate);
@@ -1046,23 +1072,6 @@ int x264_ratecontrol_new( x264_t *h )
     }
 
     x264_ratecontrol_init_reconfigurable( h, 1 );
-
-    if( h->param.i_nal_hrd )
-    {
-        uint64_t denom = (uint64_t)h->sps->vui.hrd.i_bit_rate_unscaled * h->sps->vui.i_time_scale;
-        uint64_t num = 90000;
-        x264_reduce_fraction64( &num, &denom );
-        rc->hrd_multiply_denom = 90000 / num;
-
-        double bits_required = log2( num )
-                             + log2( h->sps->vui.i_time_scale )
-                             + log2( h->sps->vui.hrd.i_cpb_size_unscaled );
-        if( bits_required >= 63 )
-        {
-            x264_log( h, X264_LOG_ERROR, "HRD with very large timescale and bufsize not supported\n" );
-            return -1;
-        }
-    }
 
     if( rc->rate_tolerance < 0.01 )
     {
@@ -2302,20 +2311,23 @@ int x264_ratecontrol_end( x264_t *h, int bits, int *filler )
     *filler = update_vbv( h, bits );
     rc->filler_bits_sum += *filler * 8;
 
-    if( h->sps->vui.b_nal_hrd_parameters_present )
+    if( h->param.i_nal_hrd )
     {
+        uint64_t denom = (uint64_t)h->sps->vui.hrd.i_bit_rate_unscaled * h->sps->vui.i_time_scale / rc->hrd_multiply_denom;
+        uint64_t multiply_factor = 54000000 / rc->hrd_multiply_denom;
+
         if( h->fenc->i_frame == 0 )
         {
             // access unit initialises the HRD
             h->fenc->hrd_timing.cpb_initial_arrival_time = 0;
             rc->initial_cpb_removal_delay = h->initial_cpb_removal_delay;
             rc->initial_cpb_removal_delay_offset = h->initial_cpb_removal_delay_offset;
-            h->fenc->hrd_timing.cpb_removal_time = rc->nrt_first_access_unit = (double)rc->initial_cpb_removal_delay / 90000;
+            h->fenc->hrd_timing.cpb_removal_time = rc->nrt_first_access_unit = (int64_t)rc->initial_cpb_removal_delay * 300;
         }
         else
         {
-            h->fenc->hrd_timing.cpb_removal_time = rc->nrt_first_access_unit + (double)(h->fenc->i_cpb_delay - h->i_cpb_delay_pir_offset) *
-                                                   h->sps->vui.i_num_units_in_tick / h->sps->vui.i_time_scale;
+            h->fenc->hrd_timing.cpb_removal_time = rc->nrt_first_access_unit + (int64_t)(h->fenc->i_cpb_delay - h->i_cpb_delay_pir_offset) *
+                                                   27000000LL * h->sps->vui.i_num_units_in_tick / h->sps->vui.i_time_scale;
 
             if( h->fenc->b_keyframe )
             {
@@ -2324,21 +2336,30 @@ int x264_ratecontrol_end( x264_t *h, int bits, int *filler )
                 rc->initial_cpb_removal_delay_offset = h->initial_cpb_removal_delay_offset;
             }
 
-            double cpb_earliest_arrival_time = h->fenc->hrd_timing.cpb_removal_time - (double)rc->initial_cpb_removal_delay / 90000;
+            int64_t cpb_earliest_arrival_time = h->fenc->hrd_timing.cpb_removal_time - rc->initial_cpb_removal_delay * 300;
+
             if( !h->fenc->b_keyframe )
-                cpb_earliest_arrival_time -= (double)rc->initial_cpb_removal_delay_offset / 90000;
+                cpb_earliest_arrival_time -= rc->initial_cpb_removal_delay_offset * 300;
+
+            /* Compare the arrival times using the 27MHz clock which should be acceptable */
+            int64_t previous_cpb_arrival_time = rc->previous_cpb_final_arrival_time_int + (multiply_factor * rc->previous_cpb_final_arrival_time_frac + denom) / (2*denom);
 
             if( h->sps->vui.hrd.b_cbr_hrd )
-                h->fenc->hrd_timing.cpb_initial_arrival_time = rc->previous_cpb_final_arrival_time;
+                h->fenc->hrd_timing.cpb_initial_arrival_time = previous_cpb_arrival_time;
             else
-                h->fenc->hrd_timing.cpb_initial_arrival_time = X264_MAX( rc->previous_cpb_final_arrival_time, cpb_earliest_arrival_time );
+                h->fenc->hrd_timing.cpb_initial_arrival_time = X264_MAX( previous_cpb_arrival_time, cpb_earliest_arrival_time );
         }
-        int filler_bits = *filler ? X264_MAX( (FILLER_OVERHEAD - h->param.b_annexb), *filler )*8 : 0;
-        // Equation C-6
-        h->fenc->hrd_timing.cpb_final_arrival_time = rc->previous_cpb_final_arrival_time = h->fenc->hrd_timing.cpb_initial_arrival_time +
-                                                     (double)(bits + filler_bits) / h->sps->vui.hrd.i_bit_rate_unscaled;
 
-        h->fenc->hrd_timing.dpb_output_time = (double)h->fenc->i_dpb_output_delay * h->sps->vui.i_num_units_in_tick / h->sps->vui.i_time_scale +
+        int filler_bits = *filler ? X264_MAX( (FILLER_OVERHEAD - h->param.b_annexb), *filler )*8 : 0;
+        uint64_t frame_size = (uint64_t)(bits + filler_bits) * h->sps->vui.i_time_scale;
+        uint64_t integer = (multiply_factor * frame_size) / (2*denom);
+
+        rc->previous_cpb_final_arrival_time_int = h->fenc->hrd_timing.cpb_initial_arrival_time + integer;
+        rc->previous_cpb_final_arrival_time_frac = frame_size - ((integer * (2*denom)) / multiply_factor);
+
+        h->fenc->hrd_timing.cpb_final_arrival_time = rc->previous_cpb_final_arrival_time_int + (multiply_factor * rc->previous_cpb_final_arrival_time_frac + denom) / (2*denom);
+
+        h->fenc->hrd_timing.dpb_output_time = (int64_t)h->fenc->i_dpb_output_delay * 27000000LL * h->sps->vui.i_num_units_in_tick / h->sps->vui.i_time_scale +
                                               h->fenc->hrd_timing.cpb_removal_time;
     }
 
@@ -2552,7 +2573,7 @@ void x264_hrd_fullness( x264_t *h )
     uint64_t denom = (uint64_t)h->sps->vui.hrd.i_bit_rate_unscaled * h->sps->vui.i_time_scale / rct->hrd_multiply_denom;
     uint64_t cpb_state = rct->buffer_fill_final;
     uint64_t cpb_size = (uint64_t)h->sps->vui.hrd.i_cpb_size_unscaled * h->sps->vui.i_time_scale;
-    uint64_t multiply_factor = 90000 / rct->hrd_multiply_denom;
+    uint64_t multiply_factor = 54000000 / rct->hrd_multiply_denom;
 
     if( rct->buffer_fill_final < 0 || rct->buffer_fill_final > (int64_t)cpb_size )
     {
@@ -2561,8 +2582,8 @@ void x264_hrd_fullness( x264_t *h )
                    (double)rct->buffer_fill_final / h->sps->vui.i_time_scale, (double)cpb_size / h->sps->vui.i_time_scale );
     }
 
-    h->initial_cpb_removal_delay = (multiply_factor * cpb_state) / denom;
-    h->initial_cpb_removal_delay_offset = (multiply_factor * cpb_size) / denom - h->initial_cpb_removal_delay;
+    h->initial_cpb_removal_delay = (multiply_factor * cpb_state + denom) / (600*denom);
+    h->initial_cpb_removal_delay_offset = (multiply_factor * cpb_size + denom) / (600*denom) - h->initial_cpb_removal_delay;
 
     int64_t decoder_buffer_fill = h->initial_cpb_removal_delay * denom / multiply_factor;
     rct->buffer_fill_final_min = X264_MIN( rct->buffer_fill_final_min, decoder_buffer_fill );
@@ -3134,6 +3155,7 @@ void x264_thread_sync_ratecontrol( x264_t *cur, x264_t *prev, x264_t *next )
         COPY(cbr_decay);
         COPY(rate_factor_constant);
         COPY(rate_factor_max_increment);
+        COPY(hrd_multiply_denom);
 #undef COPY
     }
     if( cur != next )
@@ -3149,8 +3171,9 @@ void x264_thread_sync_ratecontrol( x264_t *cur, x264_t *prev, x264_t *next )
         COPY(bframe_bits);
         COPY(initial_cpb_removal_delay);
         COPY(initial_cpb_removal_delay_offset);
+        COPY(previous_cpb_final_arrival_time_int);
+        COPY(previous_cpb_final_arrival_time_frac);
         COPY(nrt_first_access_unit);
-        COPY(previous_cpb_final_arrival_time);
 #undef COPY
     }
     //FIXME row_preds[] (not strictly necessary, but would improve prediction)

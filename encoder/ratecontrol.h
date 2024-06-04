@@ -84,4 +84,10 @@ void x264_threads_merge_ratecontrol( x264_t *h );
 #define x264_hrd_fullness x264_template(hrd_fullness)
 void x264_hrd_fullness( x264_t *h );
 
+// speedcontrol
+void x264_speedcontrol_new( x264_t *h );
+void x264_speedcontrol_delete( x264_t *h );
+void x264_speedcontrol_frame( x264_t *h );
+void x264_speedcontrol_frame_end( x264_t *h );
+
 #endif
